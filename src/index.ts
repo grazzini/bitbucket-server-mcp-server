@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import http from 'http';
+import type { IncomingHttpHeaders } from 'http';
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -32,6 +35,7 @@ interface BitbucketConfig {
   defaultProject?: string;
   maxLinesPerFile?: number;
   readOnly?: boolean;
+  passThrough?: boolean;
 }
 
 interface RepositoryParams {
@@ -88,8 +92,9 @@ class BitbucketServer {
   private readonly server: Server;
   private readonly api: AxiosInstance;
   private readonly config: BitbucketConfig;
+  private readonly sessionHeaders?: IncomingHttpHeaders;
 
-  constructor() {
+  constructor(sessionHeaders?: IncomingHttpHeaders) {
     this.server = new Server(
       {
         name: 'bitbucket-server-mcp-server',
@@ -112,31 +117,67 @@ class BitbucketServer {
       maxLinesPerFile: process.env.BITBUCKET_DIFF_MAX_LINES_PER_FILE 
         ? parseInt(process.env.BITBUCKET_DIFF_MAX_LINES_PER_FILE, 10) 
         : undefined,
-      readOnly: process.env.BITBUCKET_READ_ONLY === 'true'
+      readOnly: process.env.BITBUCKET_READ_ONLY === 'true',
+      passThrough: process.env.BITBUCKET_PASS_THROUGH === 'true'
     };
 
     if (!this.config.baseUrl) {
       throw new Error('BITBUCKET_URL is required');
     }
 
-    if (!this.config.token && !(this.config.username && this.config.password)) {
-      throw new Error('Either BITBUCKET_TOKEN or BITBUCKET_USERNAME/PASSWORD is required');
+    // In pass-through mode, credentials will be provided per connection via headers
+    if (!this.config.passThrough) {
+      if (!this.config.token && !(this.config.username && this.config.password)) {
+        throw new Error('Either BITBUCKET_TOKEN or BITBUCKET_USERNAME/PASSWORD is required');
+      }
     }
 
-    // Configuration de l'instance Axios
-    this.api = axios.create({
-      baseURL: `${this.config.baseUrl}/rest/api/1.0`,
-      headers: this.config.token 
-        ? { Authorization: `Bearer ${this.config.token}` }
-        : {},
-      auth: this.config.username && this.config.password
-        ? { username: this.config.username, password: this.config.password }
-        : undefined,
-    });
+    // Save per-session headers (only present for HTTP transport)
+    this.sessionHeaders = sessionHeaders;
+
+    // Configuration of l'instance Axios
+    if (this.config.passThrough) {
+      const { authHeader, username, token } = this.extractPassThroughAuth(this.sessionHeaders);
+      const headers: Record<string, string> = {};
+      if (authHeader) {
+        headers['Authorization'] = authHeader;
+      }
+      if (process.env.BITBUCKET_DEBUG_LOG_TOKEN === 'true') {
+        const masked = token ? `${token.slice(0, 4)}...${token.slice(-4)}` : 'missing';
+        logger.info('Pass-through auth received', { username: username || 'missing', token: masked });
+      }
+      this.api = axios.create({
+        baseURL: `${this.config.baseUrl}/rest/api/1.0`,
+        headers,
+      });
+    } else {
+      this.api = axios.create({
+        baseURL: `${this.config.baseUrl}/rest/api/1.0`,
+        headers: this.config.token 
+          ? { Authorization: `Bearer ${this.config.token}` }
+          : {},
+        auth: this.config.username && this.config.password
+          ? { username: this.config.username, password: this.config.password }
+          : undefined,
+      });
+    }
 
     this.setupToolHandlers();
     
     this.server.onerror = (error) => logger.error('[MCP Error]', error);
+  }
+
+  // Extract Bearer token and pass it through directly (Bitbucket accepts Bearer tokens)
+  private extractPassThroughAuth(headers?: IncomingHttpHeaders): { username?: string; token?: string; authHeader?: string } {
+    const h = headers || {};
+    const auth = (h['authorization'] as string | undefined) || (h as any)['Authorization'];
+    
+    if (!auth || typeof auth !== 'string') {
+      return {};
+    }
+    
+    console.log({ authHeader: auth })
+    return { authHeader: auth };
   }
 
   private isPullRequestInput(args: unknown): args is PullRequestInput {
@@ -394,6 +435,18 @@ class BitbucketServer {
           }
           return project;
         };
+
+        // If in pass-through mode and missing credentials, fail fast (allow list_projects to probe)
+        const requireAuth = (toolName: string) => !['list_projects'].includes(toolName);
+        if (this.config.passThrough && requireAuth(request.params.name)) {
+          const { authHeader } = this.extractPassThroughAuth(this.sessionHeaders);
+          if (!authHeader) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              'Missing Authorization: Bearer <token> and X-Bitbucket-Username headers for pass-through auth'
+            );
+          }
+        }
 
         switch (request.params.name) {
           case 'list_projects': {
@@ -990,16 +1043,8 @@ class BitbucketServer {
     try {
       // Use full URL for search API since it uses different base path
       const searchUrl = `${this.config.baseUrl}/rest/search/latest/search`;
-      const response = await axios.post(searchUrl, requestBody, {
-        headers: this.config.token
-          ? { 
-              Authorization: `Bearer ${this.config.token}`,
-              'Content-Type': 'application/json'
-            }
-          : { 'Content-Type': 'application/json' },
-        auth: this.config.username && this.config.password
-          ? { username: this.config.username, password: this.config.password }
-          : undefined,
+      const response = await this.api.post(searchUrl, requestBody, {
+        headers: { 'Content-Type': 'application/json' }
       });
       
       const codeResults = response.data.code || {};
@@ -1140,9 +1185,44 @@ class BitbucketServer {
   }
 
   async run() {
-    const transport = new StdioServerTransport();
+    const mode = (process.env.MCP_TRANSPORT || 'stdio').toLowerCase();
+    if (mode === 'http' || mode === 'streamable-http') {
+      const host = process.env.MCP_HOST || '0.0.0.0';
+      const port = parseInt(process.env.MCP_PORT || '8000', 10);
+      const httpServer = http.createServer((req, res) => {
+        try {
+          const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+          if (!url.pathname.startsWith('/mcp')) {
+            res.statusCode = 404;
+            res.end('Not Found');
+            return;
+          }
+          const sessionServer = new BitbucketServer(req.headers);
+          const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+          sessionServer.connect(transport)
+            .then(() => transport.handleRequest(req as any, res as any))
+            .catch((err: unknown) => {
+              logger.error('HTTP transport session error', { err });
+              try { res.statusCode = 500; res.end('Internal Server Error'); } catch {}
+            });
+        } catch (err) {
+          logger.error('HTTP server error', { err });
+          try { res.statusCode = 500; res.end('Internal Server Error'); } catch {}
+        }
+      });
+      httpServer.listen(port, host, () => {
+        logger.info(`Bitbucket MCP server running on StreamableHTTP at http://${host}:${port}/mcp`);
+      });
+    } else {
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+      logger.info('Bitbucket MCP server running on stdio');
+    }
+  }
+
+  // Public connect helper for HTTP transport sessions
+  public async connect(transport: any): Promise<void> {
     await this.server.connect(transport);
-    logger.info('Bitbucket MCP server running on stdio');
   }
 }
 
