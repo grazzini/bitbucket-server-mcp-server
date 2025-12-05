@@ -10,15 +10,36 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, InternalAxiosRequestConfig } from 'axios';
 import winston from 'winston';
+
+// Extend Axios config to include metadata for request tracing
+declare module 'axios' {
+  interface InternalAxiosRequestConfig {
+    metadata?: {
+      requestId: string;
+      startTime: number;
+    };
+  }
+}
 
 // Configuration du logger
 const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
+  level: process.env.BITBUCKET_LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
   transports: [
-    new winston.transports.File({ filename: 'bitbucket.log' })
+    new winston.transports.File({ filename: 'bitbucket.log' }),
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      ),
+      level: process.env.BITBUCKET_CONSOLE_LOG_LEVEL || 'warn'
+    })
   ]
 });
 
@@ -88,6 +109,30 @@ interface FileContentOptions extends ListOptions {
   branch?: string;
 }
 
+// Extract just the line(s) being commented on from the diff
+function extractCommentedLines(activity: any): string | null {
+  const anchor = activity.commentAnchor;
+  const diff = activity.diff;
+
+  if (!anchor || !diff?.hunks) return null;
+
+  const targetLine = anchor.line;
+  const lineType = anchor.lineType; // ADDED, REMOVED, or CONTEXT
+
+  for (const hunk of diff.hunks) {
+    for (const segment of hunk.segments || []) {
+      for (const line of segment.lines || []) {
+        // Match based on lineType - use destination for ADDED, source for REMOVED
+        const lineNum = lineType === 'REMOVED' ? line.source : line.destination;
+        if (lineNum === targetLine) {
+          return line.line;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 class BitbucketServer {
   private readonly server: Server;
   private readonly api: AxiosInstance;
@@ -137,20 +182,23 @@ class BitbucketServer {
 
     // Configuration of l'instance Axios
     if (this.config.passThrough) {
-      const { authHeader, username, token } = this.extractPassThroughAuth(this.sessionHeaders);
+      const { authHeader } = this.extractPassThroughAuth(this.sessionHeaders);
       const headers: Record<string, string> = {};
       if (authHeader) {
         headers['Authorization'] = authHeader;
-      }
-      if (process.env.BITBUCKET_DEBUG_LOG_TOKEN === 'true') {
-        const masked = token ? `${token.slice(0, 4)}...${token.slice(-4)}` : 'missing';
-        logger.info('Pass-through auth received', { username: username || 'missing', token: masked });
+        logger.debug('Pass-through auth configured for API client');
+      } else {
+        logger.warn('Pass-through mode enabled but no authorization header found');
       }
       this.api = axios.create({
         baseURL: `${this.config.baseUrl}/rest/api/1.0`,
         headers,
       });
     } else {
+      logger.debug('Using direct auth configuration', { 
+        hasToken: !!this.config.token,
+        hasUsernamePassword: !!(this.config.username && this.config.password)
+      });
       this.api = axios.create({
         baseURL: `${this.config.baseUrl}/rest/api/1.0`,
         headers: this.config.token 
@@ -161,6 +209,58 @@ class BitbucketServer {
           : undefined,
       });
     }
+
+    // Add request/response interceptors for API tracing
+    this.api.interceptors.request.use(
+      (config) => {
+        const requestId = Math.random().toString(36).substring(7);
+        config.metadata = { requestId, startTime: Date.now() };
+        logger.info('Bitbucket API Request', {
+          requestId,
+          method: config.method?.toUpperCase(),
+          url: config.url,
+          baseURL: config.baseURL,
+          fullUrl: `${config.baseURL}${config.url}`,
+          params: config.params,
+          hasAuth: !!(config.headers?.Authorization || config.auth)
+        });
+        return config;
+      },
+      (error) => {
+        logger.error('Bitbucket API Request Error', { error: error.message });
+        return Promise.reject(error);
+      }
+    );
+
+    this.api.interceptors.response.use(
+      (response) => {
+        const { requestId, startTime } = response.config.metadata || {};
+        const duration = startTime ? Date.now() - startTime : 0;
+        logger.info('Bitbucket API Response Success', {
+          requestId,
+          status: response.status,
+          statusText: response.statusText,
+          duration: `${duration}ms`,
+          dataSize: typeof response.data === 'string' ? response.data.length : JSON.stringify(response.data).length
+        });
+        return response;
+      },
+      (error) => {
+        const { requestId, startTime } = error.config?.metadata || {};
+        const duration = startTime ? Date.now() - startTime : 0;
+        logger.error('Bitbucket API Response Error', {
+          requestId,
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          duration: `${duration}ms`,
+          errorMessage: error.message,
+          responseData: error.response?.data,
+          url: error.config?.url,
+          method: error.config?.method?.toUpperCase()
+        });
+        return Promise.reject(error);
+      }
+    );
 
     this.setupToolHandlers();
     
@@ -173,10 +273,11 @@ class BitbucketServer {
     const auth = (h['authorization'] as string | undefined) || (h as any)['Authorization'];
     
     if (!auth || typeof auth !== 'string') {
+      logger.debug('No authorization header found in request');
       return {};
     }
     
-    console.log({ authHeader: auth })
+    logger.debug('Authorization header extracted successfully');
     return { authHeader: auth };
   }
 
@@ -929,66 +1030,79 @@ class BitbucketServer {
     };
   }
 
-  private async getReviews(params: PullRequestParams) {
+  // Fetch all PR activities with pagination, optionally filtering by action type
+  private async fetchAllActivities(
+    params: PullRequestParams,
+    filter?: (activity: any) => boolean
+  ): Promise<any[]> {
     const { project, repository, prId } = params;
-    
+
     if (!project || !repository || !prId) {
       throw new McpError(
         ErrorCode.InvalidParams,
         'Project, repository, and prId are required'
       );
     }
-    
-    const response = await this.api.get(
-      `/projects/${project}/repos/${repository}/pull-requests/${prId}/activities`
-    );
 
-    const reviews = response.data.values.filter(
-      (activity: BitbucketActivity) => activity.action === 'APPROVED' || activity.action === 'REVIEWED'
-    );
+    const results: any[] = [];
+    let start = 0;
+    const limit = 100;
+    let isLastPage = false;
 
+    while (!isLastPage) {
+      const response = await this.api.get(
+        `/projects/${project}/repos/${repository}/pull-requests/${prId}/activities`,
+        { params: { start, limit } }
+      );
+
+      const activities = response.data.values || [];
+      for (const activity of activities) {
+        // Apply filter if provided
+        if (filter && !filter(activity)) continue;
+
+        // Extract commented line and remove the full diff to reduce response size
+        const commentedLine = extractCommentedLines(activity);
+        const { diff, ...activityWithoutDiff } = activity;
+        if (commentedLine) {
+          activityWithoutDiff.commentedLine = commentedLine;
+        }
+        results.push(activityWithoutDiff);
+      }
+
+      isLastPage = response.data.isLastPage !== false;
+      const nextStart = response.data.nextPageStart ?? response.data.nextStart;
+      if (!isLastPage && nextStart !== undefined) {
+        start = nextStart;
+      } else {
+        isLastPage = true;
+      }
+    }
+
+    return results;
+  }
+
+  private async getReviews(params: PullRequestParams) {
+    const reviews = await this.fetchAllActivities(
+      params,
+      (activity) => activity.action === 'APPROVED' || activity.action === 'REVIEWED'
+    );
     return {
       content: [{ type: 'text', text: JSON.stringify(reviews, null, 2) }]
     };
   }
 
   private async getActivities(params: PullRequestParams) {
-    const { project, repository, prId } = params;
-    
-    if (!project || !repository || !prId) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Project, repository, and prId are required'
-      );
-    }
-    
-    const response = await this.api.get(
-      `/projects/${project}/repos/${repository}/pull-requests/${prId}/activities`
-    );
-
+    const activities = await this.fetchAllActivities(params);
     return {
-      content: [{ type: 'text', text: JSON.stringify(response.data, null, 2) }]
+      content: [{ type: 'text', text: JSON.stringify(activities, null, 2) }]
     };
   }
 
   private async getComments(params: PullRequestParams) {
-    const { project, repository, prId } = params;
-    
-    if (!project || !repository || !prId) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Project, repository, and prId are required'
-      );
-    }
-    
-    const response = await this.api.get(
-      `/projects/${project}/repos/${repository}/pull-requests/${prId}/activities`
+    const comments = await this.fetchAllActivities(
+      params,
+      (activity) => activity.action === 'COMMENTED' && activity.comment
     );
-
-    const comments = response.data.values.filter(
-      (activity: BitbucketActivity) => activity.action === 'COMMENTED'
-    );
-
     return {
       content: [{ type: 'text', text: JSON.stringify(comments, null, 2) }]
     };
