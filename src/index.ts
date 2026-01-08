@@ -95,6 +95,13 @@ interface ListRepositoriesOptions extends ListOptions {
   project?: string;
 }
 
+interface ListPullRequestsOptions extends ListOptions {
+  project?: string;
+  repository?: string;
+  state?: 'OPEN' | 'MERGED' | 'DECLINED' | 'ALL';
+  filterText?: string;
+}
+
 interface SearchOptions extends ListOptions {
   project?: string;
   repository?: string;
@@ -295,7 +302,7 @@ class BitbucketServer {
   }
 
   private setupToolHandlers() {
-    const readOnlyTools = ['list_projects', 'list_repositories', 'get_pull_request', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository'];
+    const readOnlyTools = ['list_projects', 'list_repositories', 'list_pull_requests', 'get_pull_request', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository'];
     
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
@@ -320,6 +327,26 @@ class BitbucketServer {
               limit: { type: 'number', description: 'Number of repositories to return (default: 25, max: 1000)' },
               start: { type: 'number', description: 'Start index for pagination (default: 0)' }
             }
+          }
+        },
+        {
+          name: 'list_pull_requests',
+          description: 'List pull requests for a repository with optional filtering by state and text search. Use this to find PRs related to a Jira ticket by searching for the ticket number in PR titles/descriptions. Returns PR IDs, titles, authors, status, and branch information.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
+              repository: { type: 'string', description: 'Repository slug to list pull requests from.' },
+              state: {
+                type: 'string',
+                enum: ['OPEN', 'MERGED', 'DECLINED', 'ALL'],
+                description: 'Filter by PR state (default: ALL). Use OPEN for active PRs, MERGED for completed, DECLINED for rejected.'
+              },
+              filterText: { type: 'string', description: 'Filter PRs by text in title or description (e.g., "PEX-38804" to find PRs for a Jira ticket).' },
+              limit: { type: 'number', description: 'Number of pull requests to return (default: 25, max: 100)' },
+              start: { type: 'number', description: 'Start index for pagination (default: 0)' }
+            },
+            required: ['repository']
           }
         },
         {
@@ -565,6 +592,17 @@ class BitbucketServer {
             });
           }
 
+          case 'list_pull_requests': {
+            return await this.listPullRequests({
+              project: getProject(args.project as string),
+              repository: args.repository as string,
+              state: args.state as 'OPEN' | 'MERGED' | 'DECLINED' | 'ALL',
+              filterText: args.filterText as string,
+              limit: args.limit as number,
+              start: args.start as number
+            });
+          }
+
           case 'create_pull_request': {
             if (!this.isPullRequestInput(args)) {
               throw new McpError(
@@ -782,6 +820,79 @@ class BitbucketServer {
       content: [{ 
         type: 'text', 
         text: JSON.stringify(summary, null, 2) 
+      }]
+    };
+  }
+
+  private async listPullRequests(options: ListPullRequestsOptions) {
+    const { project, repository, state = 'ALL', filterText, limit = 25, start = 0 } = options;
+
+    if (!repository) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Repository is required'
+      );
+    }
+
+    const projectKey = project || this.config.defaultProject;
+    if (!projectKey) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Project must be provided either as a parameter or through BITBUCKET_DEFAULT_PROJECT environment variable'
+      );
+    }
+
+    const endpoint = `/projects/${projectKey}/repos/${repository}/pull-requests`;
+    const params: Record<string, string | number> = { limit, start };
+
+    if (state) {
+      params.state = state;
+    }
+    if (filterText) {
+      params.filterText = filterText;
+    }
+
+    const response = await this.api.get(endpoint, { params });
+
+    const pullRequests = response.data.values || [];
+    const summary = {
+      project: projectKey,
+      repository,
+      state: state || 'ALL',
+      filterText: filterText || null,
+      total: response.data.size || pullRequests.length,
+      showing: pullRequests.length,
+      isLastPage: response.data.isLastPage,
+      nextStart: response.data.nextPageStart,
+      pullRequests: pullRequests.map((pr: {
+        id: number;
+        title: string;
+        description?: string;
+        state: string;
+        author?: { user?: { displayName?: string; name?: string } };
+        fromRef?: { displayId?: string };
+        toRef?: { displayId?: string };
+        createdDate?: number;
+        updatedDate?: number;
+        links?: { self?: { href: string }[] };
+      }) => ({
+        id: pr.id,
+        title: pr.title,
+        description: pr.description ? (pr.description.substring(0, 200) + (pr.description.length > 200 ? '...' : '')) : null,
+        state: pr.state,
+        author: pr.author?.user?.displayName || pr.author?.user?.name,
+        sourceBranch: pr.fromRef?.displayId,
+        targetBranch: pr.toRef?.displayId,
+        createdDate: pr.createdDate ? new Date(pr.createdDate).toISOString() : null,
+        updatedDate: pr.updatedDate ? new Date(pr.updatedDate).toISOString() : null,
+        url: pr.links?.self?.[0]?.href
+      }))
+    };
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(summary, null, 2)
       }]
     };
   }
@@ -1099,12 +1210,62 @@ class BitbucketServer {
   }
 
   private async getComments(params: PullRequestParams) {
-    const comments = await this.fetchAllActivities(
-      params,
-      (activity) => activity.action === 'COMMENTED' && activity.comment
+    const { project, repository, prId } = params;
+    
+    if (!project || !repository || !prId) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Project, repository, and prId are required'
+      );
+    }
+    
+    const response = await this.api.get(
+      `/projects/${project}/repos/${repository}/pull-requests/${prId}/activities`
     );
+
+    const commentActivities = response.data.values.filter(
+      (activity: BitbucketActivity) => activity.action === 'COMMENTED'
+    );
+
+    const extractComment = (comment: any, depth: number = 0, parentId?: number): any[] => {
+      const result: any[] = [];
+      if (!comment) return result;
+
+      result.push({
+        id: comment.id,
+        parentId: parentId,
+        depth: depth,
+        author: comment.author?.displayName || comment.author?.name,
+        text: comment.text,
+        createdDate: comment.createdDate,
+        updatedDate: comment.updatedDate,
+        threadResolved: comment.threadResolved,
+        severity: comment.severity,
+      });
+
+      if (comment.comments && Array.isArray(comment.comments)) {
+        for (const reply of comment.comments) {
+          result.push(...extractComment(reply, depth + 1, comment.id));
+        }
+      }
+
+      return result;
+    };
+
+    const flattenedComments = commentActivities.map((activity: any) => {
+      const anchor = activity.commentAnchor;
+      return {
+        activityId: activity.id,
+        file: anchor?.path,
+        line: anchor?.line,
+        lineType: anchor?.lineType,
+        orphaned: anchor?.orphaned,
+        thread: extractComment(activity.comment),
+      };
+    });
+
     return {
-      content: [{ type: 'text', text: JSON.stringify(comments, null, 2) }]
+      content: [{ type: 'text', text: JSON.stringify(flattenedComments, null, 2) }]
     };
   }
 
