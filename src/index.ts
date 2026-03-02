@@ -1210,23 +1210,13 @@ class BitbucketServer {
   }
 
   private async getComments(params: PullRequestParams) {
-    const { project, repository, prId } = params;
-    
-    if (!project || !repository || !prId) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Project, repository, and prId are required'
-      );
-    }
-    
-    const response = await this.api.get(
-      `/projects/${project}/repos/${repository}/pull-requests/${prId}/activities`
+    // Fetch all COMMENTED activities with pagination
+    const commentActivities = await this.fetchAllActivities(
+      params,
+      (activity) => activity.action === 'COMMENTED' && activity.comment
     );
 
-    const commentActivities = response.data.values.filter(
-      (activity: BitbucketActivity) => activity.action === 'COMMENTED'
-    );
-
+    // Recursively extract a comment and its nested replies
     const extractComment = (comment: any, depth: number = 0, parentId?: number): any[] => {
       const result: any[] = [];
       if (!comment) return result;
@@ -1252,7 +1242,7 @@ class BitbucketServer {
       return result;
     };
 
-    const flattenedComments = commentActivities.map((activity: any) => {
+    const threads = commentActivities.map((activity: any) => {
       const anchor = activity.commentAnchor;
       return {
         activityId: activity.id,
@@ -1260,12 +1250,21 @@ class BitbucketServer {
         line: anchor?.line,
         lineType: anchor?.lineType,
         orphaned: anchor?.orphaned,
+        commentedLine: activity.commentedLine,
         thread: extractComment(activity.comment),
       };
     });
 
+    const totalComments = threads.reduce(
+      (sum: number, t: any) => sum + t.thread.length, 0
+    );
+
     return {
-      content: [{ type: 'text', text: JSON.stringify(flattenedComments, null, 2) }]
+      content: [{ type: 'text', text: JSON.stringify({
+        totalThreads: threads.length,
+        totalComments,
+        threads,
+      }, null, 2) }]
     };
   }
 
