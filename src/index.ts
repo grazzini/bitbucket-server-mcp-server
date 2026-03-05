@@ -302,7 +302,7 @@ class BitbucketServer {
   }
 
   private setupToolHandlers() {
-    const readOnlyTools = ['list_projects', 'list_repositories', 'list_pull_requests', 'get_pull_request', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository'];
+    const readOnlyTools = ['list_projects', 'list_repositories', 'list_pull_requests', 'get_pull_request', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository', 'get_build_status'];
     
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
@@ -530,8 +530,20 @@ class BitbucketServer {
               project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
               repository: { type: 'string', description: 'Repository slug to browse.' },
               path: { type: 'string', description: 'Directory path to browse (empty or "/" for root directory).' },
-              branch: { type: 'string', description: 'Branch or commit hash to browse (defaults to main/master branch if not specified).' },
-              limit: { type: 'number', description: 'Maximum number of items to return (default: 50).' }
+            },
+            required: ['repository']
+          }
+        },
+        {
+          name: 'get_build_status',
+          description: 'Get CI/CD build statuses for a pull request or commit. Returns build results (SUCCESSFUL, FAILED, INPROGRESS) from CI systems like Jenkins. When given a PR ID, automatically looks up the latest commit. Returns the most recent build status along with all historical builds.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
+              repository: { type: 'string', description: 'Repository slug containing the pull request.' },
+              prId: { type: 'number', description: 'Pull request ID to get build status for. The tool will automatically resolve the latest commit hash from the PR.' },
+              commitHash: { type: 'string', description: 'Specific commit hash to check build status for. If provided, prId is not required. If both are provided, commitHash takes precedence.' }
             },
             required: ['repository']
           }
@@ -727,6 +739,14 @@ class BitbucketServer {
               branch: args.branch as string,
               limit: args.limit as number
             });
+          }
+
+          case 'get_build_status': {
+            return await this.getBuildStatus({
+              project: getProject(args.project as string),
+              repository: args.repository as string,
+              prId: args.prId as number
+            }, args.commitHash as string | undefined);
           }
 
           default:
@@ -1458,6 +1478,89 @@ class BitbucketServer {
     };
   }
 
+  private async getBuildStatus(params: PullRequestParams, commitHash?: string) {
+    const { project, repository, prId } = params;
+
+    if (!repository) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Repository is required'
+      );
+    }
+
+    let resolvedCommitHash = commitHash;
+
+    // If no commit hash provided, resolve it from the PR
+    if (!resolvedCommitHash) {
+      if (!prId) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          'Either prId or commitHash is required'
+        );
+      }
+
+      const prResponse = await this.api.get(
+        `/projects/${project}/repos/${repository}/pull-requests/${prId}` 
+      );
+      resolvedCommitHash = prResponse.data.fromRef?.latestCommit;
+
+      if (!resolvedCommitHash) {
+        throw new McpError(
+          ErrorCode.InternalError,
+          'Could not resolve commit hash from pull request'
+        );
+      }
+    }
+
+    // Build Status API uses a different base path
+    const buildStatusUrl = `${this.config.baseUrl}/rest/build-status/1.0/commits/${resolvedCommitHash}`;
+    const response = await this.api.get(buildStatusUrl, {
+      params: { limit: 25 }
+    });
+
+    const builds = response.data.values || [];
+
+    // Sort by dateAdded descending (most recent first)
+    builds.sort((a: { dateAdded: number }, b: { dateAdded: number }) =>
+      (b.dateAdded || 0) - (a.dateAdded || 0)
+    );
+
+    const latestBuild = builds.length > 0 ? builds[0] : null;
+
+    const summary = {
+      commitHash: resolvedCommitHash,
+      prId: prId || null,
+      totalBuilds: builds.length,
+      latestBuild: latestBuild ? {
+        state: latestBuild.state,
+        key: latestBuild.key,
+        name: latestBuild.name,
+        description: latestBuild.description,
+        url: latestBuild.url,
+        dateAdded: latestBuild.dateAdded ? new Date(latestBuild.dateAdded).toISOString() : null,
+      } : null,
+      allBuilds: builds.map((build: {
+        state: string;
+        key: string;
+        name?: string;
+        description?: string;
+        url: string;
+        dateAdded?: number;
+      }) => ({
+        state: build.state,
+        key: build.key,
+        name: build.name,
+        description: build.description,
+        url: build.url,
+        dateAdded: build.dateAdded ? new Date(build.dateAdded).toISOString() : null,
+      }))
+    };
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }]
+    };
+  }
+
   async run() {
     const mode = (process.env.MCP_TRANSPORT || 'stdio').toLowerCase();
     if (mode === 'http' || mode === 'streamable-http') {
@@ -1503,5 +1606,5 @@ class BitbucketServer {
 const server = new BitbucketServer();
 server.run().catch((error) => {
   logger.error('Server error', error);
-  process.exit(1);
+  process.exit(1)
 });
