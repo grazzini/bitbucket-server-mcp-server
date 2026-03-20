@@ -73,9 +73,17 @@ interface MergeOptions {
   strategy?: 'merge-commit' | 'squash' | 'fast-forward';
 }
 
+interface CommentAnchor {
+  path: string;
+  line: number;
+  lineType?: 'ADDED' | 'REMOVED' | 'CONTEXT';
+  fileType?: 'FROM' | 'TO';
+}
+
 interface CommentOptions {
   text: string;
   parentId?: number;
+  anchor?: CommentAnchor;
 }
 
 interface PullRequestInput extends RepositoryParams {
@@ -292,7 +300,7 @@ class BitbucketServer {
     const input = args as Partial<PullRequestInput>;
     return typeof args === 'object' &&
       args !== null &&
-      typeof input.project === 'string' &&
+      (input.project === undefined || typeof input.project === 'string') &&
       typeof input.repository === 'string' &&
       typeof input.title === 'string' &&
       typeof input.sourceBranch === 'string' &&
@@ -302,7 +310,7 @@ class BitbucketServer {
   }
 
   private setupToolHandlers() {
-    const readOnlyTools = ['list_projects', 'list_repositories', 'list_pull_requests', 'get_pull_request', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'search', 'get_file_content', 'browse_repository', 'get_build_status'];
+    const readOnlyTools = ['list_projects', 'list_repositories', 'list_pull_requests', 'get_pull_request', 'get_diff', 'get_reviews', 'get_activities', 'get_comments', 'get_comment_reactions', 'search', 'get_file_content', 'browse_repository', 'get_build_status'];
     
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
@@ -426,7 +434,18 @@ class BitbucketServer {
               repository: { type: 'string', description: 'Repository slug containing the pull request.' },
               prId: { type: 'number', description: 'Pull request ID to comment on.' },
               text: { type: 'string', description: 'Comment text content. Supports Markdown formatting for code blocks, links, and emphasis.' },
-              parentId: { type: 'number', description: 'ID of parent comment to reply to. Omit for top-level comments.' }
+              parentId: { type: 'number', description: 'ID of parent comment to reply to. Omit for top-level comments.' },
+              anchor: {
+                type: 'object',
+                description: 'Anchor the comment to a specific line in the diff for inline comments. Omit for top-level PR comments.',
+                properties: {
+                  path: { type: 'string', description: 'File path relative to the repository root (e.g., "src/main/java/Foo.java").' },
+                  line: { type: 'number', description: 'Line number in the diff to anchor the comment to.' },
+                  lineType: { type: 'string', enum: ['ADDED', 'REMOVED', 'CONTEXT'], description: 'Type of line: ADDED for new lines, REMOVED for deleted lines, CONTEXT for unchanged lines. Defaults to ADDED.' },
+                  fileType: { type: 'string', enum: ['FROM', 'TO'], description: 'Which side of the diff: FROM for the old file, TO for the new file. Defaults to TO.' }
+                },
+                required: ['path', 'line']
+              }
             },
             required: ['repository', 'prId', 'text']
           }
@@ -480,9 +499,24 @@ class BitbucketServer {
             properties: {
               project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
               repository: { type: 'string', description: 'Repository slug containing the pull request.' },
-              prId: { type: 'number', description: 'Pull request ID to get comments for.' }
+              prId: { type: 'number', description: 'Pull request ID to get comments for.' },
+              includeReactions: { type: 'boolean', description: 'Include emoji reactions on each comment. Requires an additional API call per comment, so only enable when needed. Defaults to false.' }
             },
             required: ['repository', 'prId']
+          }
+        },
+        {
+          name: 'get_comment_reactions',
+          description: 'Get emoji reactions (likes/emoticons) on a specific pull request comment. Returns the list of reactions and which users added them. Requires the comment-likes plugin to be enabled on the Bitbucket Server instance.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              project: { type: 'string', description: 'Bitbucket project key. If omitted, uses BITBUCKET_DEFAULT_PROJECT environment variable.' },
+              repository: { type: 'string', description: 'Repository slug containing the pull request.' },
+              prId: { type: 'number', description: 'Pull request ID containing the comment.' },
+              commentId: { type: 'number', description: 'Comment ID to get reactions for.' }
+            },
+            required: ['repository', 'prId', 'commentId']
           }
         },
         {
@@ -663,9 +697,16 @@ class BitbucketServer {
               repository: args.repository as string,
               prId: args.prId as number
             };
+            const anchorArg = args.anchor as { path: string; line: number; lineType?: string; fileType?: string } | undefined;
             return await this.addComment(commentPrParams, {
               text: args.text as string,
-              parentId: args.parentId as number
+              parentId: args.parentId as number,
+              anchor: anchorArg ? {
+                path: anchorArg.path,
+                line: anchorArg.line,
+                lineType: anchorArg.lineType as CommentAnchor['lineType'],
+                fileType: anchorArg.fileType as CommentAnchor['fileType']
+              } : undefined
             });
           }
 
@@ -706,7 +747,16 @@ class BitbucketServer {
               repository: args.repository as string,
               prId: args.prId as number
             };
-            return await this.getComments(commentsPrParams);
+            return await this.getComments(commentsPrParams, args.includeReactions as boolean);
+          }
+
+          case 'get_comment_reactions': {
+            const reactionsPrParams: PullRequestParams = {
+              project: getProject(args.project as string),
+              repository: args.repository as string,
+              prId: args.prId as number
+            };
+            return await this.getCommentReactions(reactionsPrParams, args.commentId as number);
           }
 
           case 'search': {
@@ -1024,14 +1074,24 @@ class BitbucketServer {
       );
     }
     
-    const { text, parentId } = options;
+    const { text, parentId, anchor } = options;
     
+    const body: Record<string, unknown> = { text };
+    if (parentId) {
+      body.parent = { id: parentId };
+    }
+    if (anchor) {
+      body.anchor = {
+        path: anchor.path,
+        line: anchor.line,
+        lineType: anchor.lineType || 'ADDED',
+        fileType: anchor.fileType || 'TO'
+      };
+    }
+
     const response = await this.api.post(
       `/projects/${project}/repos/${repository}/pull-requests/${prId}/comments`,
-      {
-        text,
-        parent: parentId ? { id: parentId } : undefined
-      }
+      body
     );
 
     return {
@@ -1229,14 +1289,37 @@ class BitbucketServer {
     };
   }
 
-  private async getComments(params: PullRequestParams) {
+  // Format raw reaction data from a Bitbucket comment's properties.reactions
+  private formatReactions(rawReactions: any[]): any[] {
+    return rawReactions.map((r: any) => ({
+      emoticon: r.emoticon?.shortcut || r.emoticon,
+      count: r.users?.length || 0,
+      users: (r.users || []).map((u: any) => ({
+        displayName: u.displayName,
+        name: u.name,
+        email: u.emailAddress,
+      })),
+    }));
+  }
+
+  // Fetch reactions for a single comment via the standard comment endpoint
+  private async fetchReactionsForComment(params: PullRequestParams, commentId: number): Promise<any[]> {
+    const { project, repository, prId } = params;
+    const response = await this.api.get(
+      `/projects/${project}/repos/${repository}/pull-requests/${prId}/comments/${commentId}`
+    );
+    const rawReactions = response.data?.properties?.reactions || [];
+    return this.formatReactions(rawReactions);
+  }
+
+  private async getComments(params: PullRequestParams, includeReactions?: boolean) {
     // Fetch all COMMENTED activities with pagination
     const commentActivities = await this.fetchAllActivities(
       params,
       (activity) => activity.action === 'COMMENTED' && activity.comment
     );
 
-    // Recursively extract a comment and its nested replies
+    // Recursively extract a comment and its nested replies, collecting IDs
     const extractComment = (comment: any, depth: number = 0, parentId?: number): any[] => {
       const result: any[] = [];
       if (!comment) return result;
@@ -1275,6 +1358,19 @@ class BitbucketServer {
       };
     });
 
+    // Optionally fetch reactions for each comment
+    if (includeReactions) {
+      for (const thread of threads) {
+        for (const comment of thread.thread) {
+          try {
+            comment.reactions = await this.fetchReactionsForComment(params, comment.id);
+          } catch {
+            comment.reactions = [];
+          }
+        }
+      }
+    }
+
     const totalComments = threads.reduce(
       (sum: number, t: any) => sum + t.thread.length, 0
     );
@@ -1284,6 +1380,16 @@ class BitbucketServer {
         totalThreads: threads.length,
         totalComments,
         threads,
+      }, null, 2) }]
+    };
+  }
+
+  private async getCommentReactions(params: PullRequestParams, commentId: number) {
+    const reactions = await this.fetchReactionsForComment(params, commentId);
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        commentId,
+        reactions,
       }, null, 2) }]
     };
   }
