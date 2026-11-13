@@ -3,7 +3,7 @@ jest.mock('@modelcontextprotocol/sdk/server/index.js');
 jest.mock('axios');
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { McpError, ErrorCode, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { McpError, ErrorCode, CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import axios, { AxiosInstance } from 'axios';
 
 
@@ -728,6 +728,52 @@ describe('BitbucketServer', () => {
       expect(parsed.totalBuilds).toBe(0);
       expect(parsed.latestBuild).toBeNull();
       expect(parsed.allBuilds).toEqual([]);
+    });
+  });
+
+  describe('Tool annotations', () => {
+    test('should mark exactly the read-only tools with readOnlyHint', async () => {
+      // Arrange
+      const handlers = mockServer.setRequestHandler.mock.calls;
+      const listHandler = handlers.find(([schema]) => schema === ListToolsRequestSchema)?.[1];
+      if (!listHandler) throw new Error('Handler not found');
+
+      const request = {
+        method: 'tools/list',
+        params: {}
+      };
+
+      const extra: RequestExtra = {
+        signal: mockAbortController.signal,
+        requestId: 'test-request-id',
+        sendNotification: jest.fn(),
+        sendRequest: jest.fn()
+      };
+
+      // Act
+      const result = await listHandler(request, extra) as { tools: Array<{ name: string; annotations?: { readOnlyHint?: boolean } }> };
+      const hints = Object.fromEntries(result.tools.map(tool => [tool.name, tool.annotations?.readOnlyHint]));
+
+      // Assert
+      expect(hints).toEqual({
+        list_projects: true,
+        list_repositories: true,
+        list_pull_requests: true,
+        get_pull_request: true,
+        get_diff: true,
+        get_reviews: true,
+        get_activities: true,
+        get_comments: true,
+        get_comment_reactions: true,
+        search: true,
+        get_file_content: true,
+        browse_repository: true,
+        get_build_status: true,
+        create_pull_request: false,
+        merge_pull_request: false,
+        decline_pull_request: false,
+        add_comment: false
+      });
     });
   });
 });

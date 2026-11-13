@@ -582,7 +582,12 @@ class BitbucketServer {
             required: ['repository']
           }
         }
-      ].filter(tool => !this.config.readOnly || readOnlyTools.includes(tool.name))
+      ]
+        .filter(tool => !this.config.readOnly || readOnlyTools.includes(tool.name))
+        .map(tool => ({
+          ...tool,
+          annotations: { readOnlyHint: readOnlyTools.includes(tool.name) },
+        }))
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
